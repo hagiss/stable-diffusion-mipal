@@ -426,7 +426,11 @@ class LatentDiffusion(DDPM):
     def __init__(self,
                  first_stage_config,
                  cond_stage_config,
+                 use_frame_cond=False,
+                 frame_cond_stage_config=None,
+                 num_task_embeddings=0,
                  num_timesteps_cond=None,
+                 num_start_timesteps=None,
                  cond_stage_key="image",
                  cond_stage_trainable=False,
                  concat_mode=True,
@@ -436,6 +440,7 @@ class LatentDiffusion(DDPM):
                  scale_by_std=False,
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
+        self.num_start_timesteps = default(num_start_timesteps, 0)
         self.scale_by_std = scale_by_std
         assert self.num_timesteps_cond <= kwargs['timesteps']
         # for backwards compatibility after implementation of DiffusionWrapper
@@ -459,6 +464,12 @@ class LatentDiffusion(DDPM):
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
+        self.use_frame_cond = use_frame_cond
+        if use_frame_cond:
+            self.instantiate_frame_cond_stage(frame_cond_stage_config)
+        self.use_task_embedding = num_task_embeddings > 0
+        if num_task_embeddings > 0:
+            self.task_embeddings = nn.Parameter(torch.randn(num_task_embeddings, self.frame_cond_stage_model.temporal_pooler.dim))
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None  
@@ -498,6 +509,10 @@ class LatentDiffusion(DDPM):
         self.shorten_cond_schedule = self.num_timesteps_cond > 1
         if self.shorten_cond_schedule:
             self.make_cond_schedule()
+
+    def instantiate_frame_cond_stage(self, config):
+        model = instantiate_from_config(config)
+        self.frame_cond_stage_model = model.train()
 
     def instantiate_first_stage(self, config):
         model = instantiate_from_config(config)
@@ -555,11 +570,14 @@ class LatentDiffusion(DDPM):
                 if isinstance(c, DiagonalGaussianDistribution):
                     c = c.mode()
             else:
-                c = self.cond_stage_model(c)
+                c = self.cond_stage_model(c) # attention_pooler
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
             c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
         return c
+
+    def get_frame_conditioning(self, frames): # [batch, frames, ch, h, w] (4, 64, 64)
+        return self.frame_cond_stage_model(frames)
 
     def meshgrid(self, h, w):
         y = torch.arange(0, h).view(h, 1, 1).repeat(1, w, 1)
@@ -654,18 +672,21 @@ class LatentDiffusion(DDPM):
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None):
         x = super().get_input(batch, k)
-        if bs is not None:
-            x = x[:bs]
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
-        z = self.get_first_stage_encoding(encoder_posterior).detach()
+        z = self.get_first_stage_encoding(encoder_posterior).detach() # [bs * frames, c, h ,w]
+        z = rearrange(z, '(b f) c h w -> b f c h w', b=bs)
+        if bs is not None:
+            z = z[:bs]
+
+        t = torch.randint(1, z.shape[1], (1), device=self.device).long()
 
         if self.model.conditioning_key is not None:
             if cond_key is None:
                 cond_key = self.cond_stage_key
             if cond_key != self.first_stage_key:
                 if cond_key in ['caption', 'coordinates_bbox']:
-                    xc = batch[cond_key]
+                    xc = batch[cond_key] # if cond_key is txt [bs, seq]
                 elif cond_key == 'class_label':
                     xc = batch
                 else:
@@ -675,13 +696,27 @@ class LatentDiffusion(DDPM):
             if not self.cond_stage_trainable or force_c_encode:
                 if isinstance(xc, dict) or isinstance(xc, list):
                     # import pudb; pudb.set_trace()
-                    c = self.get_learned_conditioning(xc)
+                    c = self.get_learned_conditioning(xc) # [bs, seq, dim]
                 else:
                     c = self.get_learned_conditioning(xc.to(self.device))
             else:
                 c = xc
+
             if bs is not None:
                 c = c[:bs]
+
+            if self.use_frame_cond:
+                previous_frames = z[:, :t]
+                z = z[:, t] # [batch, c, h, w]
+
+                fc = self.get_frame_conditioning(previous_frames) # [batch, patches, 4, dim]
+
+                c = repeat(c, "b s d -> b p s d", p=fc.shape[1])
+                c = torch.cat([fc, c], dim=-2) # [batch, patches, seq + 4, dim]
+
+                if self.use_task_embedding:
+                    task_embeddings = repeat(self.task_embeddings, "s d -> b p s d", b=c.shape[0], p=c.shape[1])
+                    c = torch.cat([task_embeddings, c], dim=-2)
 
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
@@ -863,12 +898,13 @@ class LatentDiffusion(DDPM):
             return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
+        # TODO do the frame things and concat to text condition
         x, c = self.get_input(batch, self.first_stage_key)
         loss = self(x, c)
         return loss
 
     def forward(self, x, c, *args, **kwargs):
-        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        t = torch.randint(self.num_start_timesteps, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
@@ -888,7 +924,7 @@ class LatentDiffusion(DDPM):
 
         return [rescale_bbox(b) for b in bboxes]
 
-    def apply_model(self, x_noisy, t, cond, return_ids=False):
+    def apply_model(self, x_noisy, t, cond, return_ids=False): # x_noisy, t is same with before used
 
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
